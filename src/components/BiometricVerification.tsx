@@ -1,11 +1,28 @@
-
 import React, { useState, useEffect } from "react";
 import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from "@/components/ui/card";
-import { Button } from "@/components/ui/button";
+import { Button, type ButtonProps } from "@/components/ui/button";
 import { Fingerprint, CheckCircle2, AlertCircle, Smartphone, Wifi, WifiOff } from "lucide-react";
 import { toast } from "sonner";
 import { supabase } from "@/integrations/supabase/client";
 import { useIsMobile } from "@/hooks/use-mobile";
+
+// Custom types for WebAuthn
+interface AuthenticatorAttestationResponse extends AuthenticatorResponse {
+  readonly clientDataJSON: ArrayBuffer;
+  readonly attestationObject: ArrayBuffer;
+  getAuthenticatorData(): ArrayBuffer;
+  getPublicKey(): ArrayBuffer | null;
+  getPublicKeyAlgorithm(): number;
+  getTransports(): string[];
+}
+
+interface PublicKeyCredentialWithAttestation extends PublicKeyCredential {
+  readonly response: AuthenticatorAttestationResponse;
+}
+
+interface PublicKeyCredentialWithAssertion extends PublicKeyCredential {
+  readonly response: AuthenticatorAssertionResponse;
+}
 
 interface BiometricVerificationProps {
   onVerified: () => void;
@@ -97,10 +114,32 @@ const BiometricVerification = ({ onVerified, onCancel, userId }: BiometricVerifi
     };
   }, []);
 
+  // Check WebAuthn support on component mount
+  useEffect(() => {
+    const checkWebAuthnSupport = async () => {
+      try {
+        const supported = !!window.PublicKeyCredential && 
+                       (await PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable?.() ?? false);
+        setIsWebAuthnSupported(supported);
+        setBiometricAvailable(supported);
+      } catch (error) {
+        console.error('Error checking WebAuthn support:', error);
+        setIsWebAuthnSupported(false);
+        setBiometricAvailable(false);
+      }
+    };
+    
+    checkWebAuthnSupport();
+  }, []);
+
   // Get fingerprint data using WebAuthn
-  const getFingerprintData = async (): Promise<PublicKeyCredential> => {
+  const getFingerprintData = async (): Promise<PublicKeyCredentialWithAttestation> => {
+    console.log("Starting getFingerprintData...");
+    
     if (!window.PublicKeyCredential) {
-      throw new Error("WebAuthn is not supported in this browser");
+      const errorMsg = "WebAuthn is not supported in this browser";
+      console.error(errorMsg);
+      throw new Error(errorMsg);
     }
     
     try {
@@ -112,29 +151,46 @@ const BiometricVerification = ({ onVerified, onCancel, userId }: BiometricVerifi
       
       console.log("Creating WebAuthn credential with user ID:", userIdToUse);
       
-      // Create credential options
+      // Check if WebAuthn is available
+      const isAvailable = await PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable();
+      console.log("WebAuthn platform authenticator available:", isAvailable);
+      
+      if (!isAvailable) {
+        const errorMsg = "No biometric authenticator (like fingerprint or face ID) is available on this device";
+        console.error(errorMsg);
+        throw new Error(errorMsg);
+      }
+      
+      // Prepare user ID as ArrayBuffer
+      const userIdBuffer = new TextEncoder().encode(userIdToUse);
+      
+      // Create credential options with proper types
       const publicKeyCredentialCreationOptions: PublicKeyCredentialCreationOptions = {
-        challenge,
+        challenge: challenge.buffer.slice(
+          challenge.byteOffset, 
+          challenge.byteOffset + challenge.byteLength
+        ),
         rp: {
-          name: "VoteGuard",
-          id: window.location.hostname
+          name: "Secure Campus Voting",
+          id: window.location.hostname || 'localhost' // Fallback for localhost
         },
         user: {
-          id: new TextEncoder().encode(userIdToUse),
+          id: userIdBuffer,
           name: userIdToUse,
-          displayName: userId ? "Registered User" : "New Registration"
+          displayName: `User ${userIdToUse.substring(0, 8)}`
         },
         pubKeyCredParams: [
           { type: "public-key", alg: -7 }, // ES256
           { type: "public-key", alg: -257 } // RS256
         ],
-        authenticatorSelection: {
-          authenticatorAttachment: "platform",
-          userVerification: "required",
-          requireResidentKey: true
-        },
         timeout: 60000,
-        attestation: "none"  // Changed from "direct" to "none" for better compatibility
+        attestation: "none" as const,
+        authenticatorSelection: {
+          authenticatorAttachment: "platform" as const,
+          requireResidentKey: true,
+          userVerification: "required" as const
+        },
+        excludeCredentials: []
       };
       
       console.log("WebAuthn options:", JSON.stringify(publicKeyCredentialCreationOptions, (key, value) => {
@@ -144,33 +200,69 @@ const BiometricVerification = ({ onVerified, onCancel, userId }: BiometricVerifi
         return value;
       }));
       
-      const credential = await navigator.credentials.create({
-        publicKey: publicKeyCredentialCreationOptions
-      });
-      
-      if (!credential) {
-        throw new Error("No credential returned from WebAuthn");
-      }
-      
-      console.log("Credential created successfully:", {
-        id: credential.id,
-        type: credential.type,
-        rawId: credential.rawId ? `Uint8Array(${new Uint8Array(credential.rawId).length})` : null,
-        response: {
-          clientDataJSON: credential.response.clientDataJSON ? '[...]' : null,
-          attestationObject: credential.response.attestationObject ? '[...]' : null
+      // Log the credential creation options for debugging (without the actual binary data)
+      const logOptions = {
+        ...publicKeyCredentialCreationOptions,
+        challenge: `[${challenge.byteLength} bytes]`,
+        user: {
+          ...publicKeyCredentialCreationOptions.user,
+          id: `[${(publicKeyCredentialCreationOptions.user.id as ArrayBuffer).byteLength} bytes]`
         }
-      });
+      };
+      console.log("Creating WebAuthn credential with options:", logOptions);
       
-      return credential as PublicKeyCredential;
+      try {
+        // Create the WebAuthn credential with proper type assertion
+        const credential = (await navigator.credentials.create({
+          publicKey: {
+            ...publicKeyCredentialCreationOptions,
+            challenge: challenge.buffer.slice(
+              challenge.byteOffset,
+              challenge.byteOffset + challenge.byteLength
+            ),
+            user: {
+              ...publicKeyCredentialCreationOptions.user,
+              id: userIdBuffer
+            }
+          }
+        })) as unknown as PublicKeyCredentialWithAttestation;
+        
+        if (!credential) {
+          throw new Error('No credential returned from authenticator');
+        }
+        
+        if (!credential) {
+          throw new Error("No credential returned from WebAuthn");
+        }
+        
+        console.log("WebAuthn credential created successfully:", {
+          id: credential.id,
+          type: credential.type,
+          rawId: Array.from(new Uint8Array(credential.rawId))
+        });
+        
+        return credential;
+      } catch (error) {
+        console.error("Error creating WebAuthn credential:", error);
+        if (error.name === 'NotAllowedError') {
+          throw new Error("Registration was cancelled by the user or no authenticator was available");
+        } else if (error.name === 'NotSupportedError') {
+          throw new Error("This device or browser does not support the requested authenticator type");
+        } else if (error.name === 'InvalidStateError') {
+          throw new Error("An authenticator was found, but it might already be registered");
+        } else if (error.name === 'AbortError') {
+          throw new Error("The operation was aborted by the user");
+        }
+        throw error; // Re-throw any other errors
+      }
     } catch (error) {
-      console.error("WebAuthn credential creation failed:", error);
-      throw new Error(`Failed to create credential: ${error.message}`);
+      console.error("Error in getFingerprintData:", error);
+      throw error; // Re-throw to be caught by the caller
     }
   };
 
   // Store fingerprint in the database
-  const storeFingerprintInDb = async (userId: string, credential: PublicKeyCredential) => {
+  const storeFingerprintInDb = async (userId: string, credential: PublicKeyCredentialWithAttestation) => {
     console.log("Starting to store fingerprint for user:", userId);
     
     try {
@@ -187,9 +279,19 @@ const BiometricVerification = ({ onVerified, onCancel, userId }: BiometricVerifi
       
       // Convert credential data to a hash for storage
       const arrayBufferToHex = (buffer: ArrayBuffer): string => {
-        return Array.from(new Uint8Array(buffer))
+        const bytes = new Uint8Array(buffer);
+        return Array.from(bytes)
           .map(b => b.toString(16).padStart(2, '0'))
           .join('');
+      };
+      
+      // Helper to safely log binary data
+      const bufferToLogString = (buffer: ArrayBuffer): string => {
+        try {
+          return `[${new Uint8Array(buffer).length} bytes]`;
+        } catch {
+          return '[invalid buffer]';
+        }
       };
       
       // Create a unique fingerprint hash from the credential data
@@ -241,7 +343,7 @@ const BiometricVerification = ({ onVerified, onCancel, userId }: BiometricVerifi
   };
 
   // Verify fingerprint against database
-  const verifyFingerprintInDb = async (userId: string, credential: PublicKeyCredential) => {
+  const verifyFingerprintInDb = async (userId: string, credential: PublicKeyCredentialWithAttestation) => {
     try {
       // Convert credential data to a hash for comparison
       const arrayBufferToHex = (buffer: ArrayBuffer): string => {
@@ -534,7 +636,6 @@ const BiometricVerification = ({ onVerified, onCancel, userId }: BiometricVerifi
         {!isScanning ? (
           <>
             <Button 
-              variant="outline" 
               onClick={onCancel}
               className="border-vote-primary text-vote-primary hover:bg-vote-primary hover:text-white"
             >
@@ -549,7 +650,6 @@ const BiometricVerification = ({ onVerified, onCancel, userId }: BiometricVerifi
           </>
         ) : (
           <Button 
-            variant="outline" 
             onClick={() => {
               setIsScanning(false);
               toast.error("Scan cancelled");
