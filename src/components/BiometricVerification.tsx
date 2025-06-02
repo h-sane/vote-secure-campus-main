@@ -65,18 +65,11 @@ const BiometricVerification = ({ onVerified, onCancel, userId }: BiometricVerifi
           networkOnline: isOnline
         });
         
-        // Determine overall biometric availability
-        if ((isMobileDevice && hasWebAuthn) || hasBiometricCapability) {
-          // On mobile with WebAuthn or device with verified platform authenticator
-          setBiometricAvailable(true);
-          console.log("Biometric capability detected!");
-        } else if (isMobileDevice) {
-          // On mobile but WebAuthn questionable - assume it might work
-          setBiometricAvailable(true);
-          console.log("Mobile device detected, assuming biometric capability");
-        } else {
-          setBiometricAvailable(false);
-          console.log("No biometric capability detected");
+        // Only allow biometric verification if we have proper biometric capability
+        setBiometricAvailable(hasBiometricCapability);
+        
+        if (!hasBiometricCapability) {
+          toast.error("No biometric sensor detected. Please use a device with fingerprint scanner.");
         }
       } catch (error) {
         console.error("Error during biometric capability check:", error);
@@ -104,48 +97,17 @@ const BiometricVerification = ({ onVerified, onCancel, userId }: BiometricVerifi
     };
   }, []);
 
-  // Function to generate a fingerprint hash from fingerprint data
-  const generateFingerprintHash = async (fingerprintData: any): Promise<string> => {
-    // In a real implementation, this would use a proper cryptographic hash function
-    const dataString = JSON.stringify(fingerprintData);
-    
-    // Use SubtleCrypto API to create a hash if available
-    if (window.crypto && window.crypto.subtle) {
-      try {
-        const encoder = new TextEncoder();
-        const data = encoder.encode(dataString);
-        const hashBuffer = await window.crypto.subtle.digest('SHA-256', data);
-        
-        // Convert hash to hex string
-        const hashArray = Array.from(new Uint8Array(hashBuffer));
-        return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
-      } catch (error) {
-        console.error("Error generating fingerprint hash:", error);
-        // Fallback to a simpler hash for demo purposes
-        return btoa(dataString).slice(0, 32);
-      }
-    } else {
-      // Fallback for browsers without SubtleCrypto
-      return btoa(dataString).slice(0, 32);
-    }
-  };
-
   // Get fingerprint data using WebAuthn
-  const getFingerprintData = async (): Promise<any> => {
+  const getFingerprintData = async (): Promise<PublicKeyCredential> => {
     if (!window.PublicKeyCredential) {
-      console.error("WebAuthn is not supported in this browser");
       throw new Error("WebAuthn is not supported in this browser");
     }
     
     try {
-      // Create a challenge
-      const challenge = new Uint8Array(32);
-      window.crypto.getRandomValues(challenge);
+      // Create a secure challenge
+      const challenge = crypto.getRandomValues(new Uint8Array(32));
       
-      // Create a user ID if none provided (registration flow)
-      const userIdValue = crypto.randomUUID();
-      
-      // Create the credential options
+      // Create credential options
       const publicKeyCredentialCreationOptions: PublicKeyCredentialCreationOptions = {
         challenge,
         rp: {
@@ -153,22 +115,24 @@ const BiometricVerification = ({ onVerified, onCancel, userId }: BiometricVerifi
           id: window.location.hostname
         },
         user: {
-          id: Uint8Array.from(userIdValue, c => c.charCodeAt(0)),
-          name: "user@example.com",
-          displayName: "VoteGuard User"
+          id: new TextEncoder().encode(userId || crypto.randomUUID()),
+          name: userId || crypto.randomUUID(),
+          displayName: userId ? "Registered User" : "New Registration"
         },
         pubKeyCredParams: [
-          { type: "public-key" as const, alg: -7 }, // ES256
-          { type: "public-key" as const, alg: -257 } // RS256
+          { type: "public-key", alg: -7 }, // ES256
+          { type: "public-key", alg: -257 } // RS256
         ],
         authenticatorSelection: {
           authenticatorAttachment: "platform",
-          userVerification: "required"
+          userVerification: "required",
+          requireResidentKey: true
         },
-        timeout: 60000
+        timeout: 60000,
+        attestation: "direct"
       };
       
-      console.log("Starting WebAuthn credential creation", publicKeyCredentialCreationOptions);
+      console.log("Starting WebAuthn credential creation");
       
       const credential = await navigator.credentials.create({
         publicKey: publicKeyCredentialCreationOptions
@@ -178,7 +142,7 @@ const BiometricVerification = ({ onVerified, onCancel, userId }: BiometricVerifi
         throw new Error("No credential returned");
       }
       
-      console.log("Credential created successfully", credential);
+      console.log("Credential created successfully");
       return credential;
     } catch (error) {
       console.error("WebAuthn credential creation error:", error);
@@ -187,28 +151,34 @@ const BiometricVerification = ({ onVerified, onCancel, userId }: BiometricVerifi
   };
 
   // Store fingerprint in the database
-  const storeFingerprintInDb = async (userId: string, fingerprintData: any) => {
+  const storeFingerprintInDb = async (userId: string, credential: PublicKeyCredential) => {
     try {
-      const fingerprintHash = await generateFingerprintHash(fingerprintData);
+      // Verify the credential is from a biometric sensor
+      const isBiometric = await PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable();
       
-      // Get device info for additional security
-      const deviceInfo = {
-        userAgent: navigator.userAgent,
-        platform: navigator.platform,
-        language: navigator.language,
-        screenSize: `${window.screen.width}x${window.screen.height}`,
-        timestamp: new Date().toISOString()
+      if (!isBiometric) {
+        throw new Error("Biometric sensor not detected");
+      }
+      
+      // Store the credential data
+      const credentialData = {
+        id: credential.id,
+        rawId: Array.from(new Uint8Array(credential.rawId)),
+        type: credential.type,
+        response: {
+          clientDataJSON: Array.from(new Uint8Array(credential.response.clientDataJSON)),
+          attestationObject: Array.from(new Uint8Array(credential.response.attestationObject))
+        }
       };
-      
-      console.log("Storing fingerprint for user:", userId);
       
       // Store in Supabase
       const { error } = await supabase
         .from('users_biometrics')
         .upsert({
           user_id: userId,
-          fingerprint_hash: fingerprintHash,
-          device_info: deviceInfo,
+          credential_id: credential.id,
+          credential_data: credentialData,
+          created_at: new Date().toISOString(),
           updated_at: new Date().toISOString()
         });
         
@@ -226,35 +196,65 @@ const BiometricVerification = ({ onVerified, onCancel, userId }: BiometricVerifi
   };
 
   // Verify fingerprint against database
-  const verifyFingerprintInDb = async (userId: string, fingerprintData: any) => {
+  const verifyFingerprintInDb = async (userId: string, credential: PublicKeyCredential) => {
     try {
-      const fingerprintHash = await generateFingerprintHash(fingerprintData);
-      
-      console.log("Verifying fingerprint for user:", userId);
-      
-      // Query Supabase to check the fingerprint
-      const { data, error } = await supabase
+      // Get stored credential
+      const { data: storedData, error: fetchError } = await supabase
         .from('users_biometrics')
-        .select('fingerprint_hash')
+        .select('credential_data')
         .eq('user_id', userId)
         .single();
       
-      if (error) {
-        console.error("Supabase error verifying fingerprint:", error);
+      if (fetchError || !storedData || !storedData.credential_data) {
+        console.log("No stored credential found");
         return false;
       }
       
-      // Compare the stored hash with the current one
-      const isMatch = data?.fingerprint_hash === fingerprintHash;
-      console.log("Fingerprint verification result:", isMatch);
-      return isMatch;
+      // Verify using WebAuthn
+      const publicKeyCredentialRequestOptions: PublicKeyCredentialRequestOptions = {
+        challenge: crypto.getRandomValues(new Uint8Array(32)),
+        allowCredentials: [{
+          type: "public-key",
+          id: credential.rawId
+        }],
+        timeout: 60000,
+        userVerification: "required"
+      };
+      
+      const assertion = await navigator.credentials.get({
+        publicKey: publicKeyCredentialRequestOptions
+      });
+      
+      if (!assertion) {
+        return false;
+      }
+      
+      // Verify the signature
+      const response = assertion.response;
+      const authData = new Uint8Array(response.authenticatorData);
+      const clientDataJSON = new Uint8Array(response.clientDataJSON);
+      
+      // Verify the response
+      const verified = await crypto.subtle.verify(
+        'ECDSA',
+        storedData.credential_data.publicKey,
+        response.signature,
+        authData
+      );
+      
+      return verified;
     } catch (error) {
-      console.error("Error during verification:", error);
+      console.error("Verification error:", error);
       return false;
     }
   };
 
   const startScan = async () => {
+    if (!biometricAvailable) {
+      toast.error("Biometric verification not available on this device");
+      return;
+    }
+
     setIsScanning(true);
     setProgress(0);
     
@@ -270,89 +270,39 @@ const BiometricVerification = ({ onVerified, onCancel, userId }: BiometricVerifi
     }, 300);
     
     try {
-      // First try WebAuthn
-      let fingerprintData;
       let verificationSuccess = false;
       
+      // Only use WebAuthn for verification
       if (isWebAuthnSupported) {
         try {
           console.log("Attempting WebAuthn authentication");
-          fingerprintData = await getFingerprintData();
+          const credential = await getFingerprintData();
           setProgress(80);
           
           if (userId) {
             // In verification flow (voting)
-            verificationSuccess = await verifyFingerprintInDb(userId, fingerprintData);
+            verificationSuccess = await verifyFingerprintInDb(userId, credential);
             setVerificationAttempts(prev => prev + 1);
             
-            console.log("Verification flow result:", verificationSuccess);
-          } else {
-            // In registration flow
-            // Generate a temporary user ID for registration since we don't have one yet
-            const tempUserId = crypto.randomUUID();
-            verificationSuccess = await storeFingerprintInDb(tempUserId, fingerprintData);
-            
-            console.log("Registration flow result:", verificationSuccess);
-          }
-        } catch (webAuthnError) {
-          console.warn("WebAuthn failed, trying fallback:", webAuthnError);
-          
-          // Use device fingerprinting as fallback
-          const deviceFingerprint = {
-            userAgent: navigator.userAgent,
-            language: navigator.language,
-            platform: navigator.platform,
-            screenResolution: `${window.screen.width}x${window.screen.height}`,
-            timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone,
-            timestamp: new Date().toISOString()
-          };
-          
-          if (userId) {
-            // In voting flow, provide simulated verification after enough attempts
-            setVerificationAttempts(prev => prev + 1);
-            verificationSuccess = await verifyFingerprintInDb(userId, deviceFingerprint);
-            
-            // If device fingerprinting fails after multiple attempts, simulate success
-            if (!verificationSuccess && verificationAttempts >= 1) {
-              console.log("Allowing verification after multiple attempts");
-              verificationSuccess = true;
+            if (!verificationSuccess) {
+              toast.error("Fingerprint does not match registered fingerprint");
             }
           } else {
-            // In registration flow, use device fingerprint
-            const tempUserId = crypto.randomUUID();
-            verificationSuccess = await storeFingerprintInDb(tempUserId, deviceFingerprint);
+            // In registration flow
+            verificationSuccess = await storeFingerprintInDb(userId || crypto.randomUUID(), credential);
+            
+            if (!verificationSuccess) {
+              toast.error("Failed to register fingerprint");
+            }
           }
+        } catch (error) {
+          console.error("WebAuthn error:", error);
+          toast.error("Failed to authenticate with biometric sensor");
+          verificationSuccess = false;
         }
       } else {
-        console.log("WebAuthn not supported, using device fingerprinting fallback");
-        
-        // Use device fingerprinting as fallback
-        const deviceFingerprint = {
-          userAgent: navigator.userAgent,
-          language: navigator.language,
-          platform: navigator.platform,
-          screenResolution: `${window.screen.width}x${window.screen.height}`,
-          timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone,
-          timestamp: new Date().toISOString()
-        };
-        
-        // Simulate processing time for better UX
-        await new Promise(resolve => setTimeout(resolve, 1500));
-        
-        if (userId) {
-          // In voting flow
-          setVerificationAttempts(prev => prev + 1);
-          verificationSuccess = await verifyFingerprintInDb(userId, deviceFingerprint);
-          
-          // For demo, succeed after enough attempts
-          if (!verificationSuccess && verificationAttempts >= 1) {
-            verificationSuccess = true;
-          }
-        } else {
-          // In registration flow
-          const tempUserId = crypto.randomUUID();
-          verificationSuccess = await storeFingerprintInDb(tempUserId, deviceFingerprint);
-        }
+        verificationSuccess = false;
+        toast.error("WebAuthn not supported on this device");
       }
       
       clearInterval(progressInterval);
@@ -363,9 +313,7 @@ const BiometricVerification = ({ onVerified, onCancel, userId }: BiometricVerifi
         
         if (verificationSuccess) {
           onVerified();
-          toast.success(userId ? "Fingerprint verified successfully!" : "Fingerprint registered successfully!");
-        } else {
-          toast.error("Fingerprint verification failed. Please try again.");
+          toast.success(userId ? "Biometric verification successful!" : "Biometric registration successful!");
         }
       }, 500);
       
